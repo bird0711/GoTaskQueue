@@ -1,0 +1,36 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Go build artifacts
+bin/
+build/
+dist/
+tmp/
+*.test
+coverage.out
+cover.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Local runtime state
+*.pid
+*.sock
+
+# Dependency service data
+.docker-data/
+postgres-data/
+redis-data/
+prometheus-data/
