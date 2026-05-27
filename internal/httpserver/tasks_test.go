@@ -9,9 +9,11 @@ import (
 )
 
 func TestValidateCreateTaskRequestDefaultsToImmediateTask(t *testing.T) {
+	idempotencyKey := "request-123"
 	params, err := validateCreateTaskRequest(createTaskRequest{
-		TaskType: "email.send",
-		Payload:  json.RawMessage(`{"to":"user@example.com"}`),
+		TaskType:       "email.send",
+		Payload:        json.RawMessage(`{"to":"user@example.com"}`),
+		IdempotencyKey: &idempotencyKey,
 	})
 	if err != nil {
 		t.Fatalf("validate request: %v", err)
@@ -26,8 +28,25 @@ func TestValidateCreateTaskRequestDefaultsToImmediateTask(t *testing.T) {
 	if params.MaxRetries != 3 {
 		t.Fatalf("expected default max retries 3, got %d", params.MaxRetries)
 	}
+	if params.IdempotencyKey == nil || *params.IdempotencyKey != idempotencyKey {
+		t.Fatalf("expected idempotency key %q, got %#v", idempotencyKey, params.IdempotencyKey)
+	}
 	if params.RunAt.After(time.Now().UTC().Add(1 * time.Second)) {
 		t.Fatalf("expected immediate run_at, got %s", params.RunAt)
+	}
+}
+
+func TestValidateCreateTaskRequestTrimsIdempotencyKey(t *testing.T) {
+	idempotencyKey := " request-123 "
+	params, err := validateCreateTaskRequest(createTaskRequest{
+		TaskType:       "email.send",
+		IdempotencyKey: &idempotencyKey,
+	})
+	if err != nil {
+		t.Fatalf("validate request: %v", err)
+	}
+	if params.IdempotencyKey == nil || *params.IdempotencyKey != "request-123" {
+		t.Fatalf("expected trimmed idempotency key, got %#v", params.IdempotencyKey)
 	}
 }
 

@@ -27,6 +27,12 @@
 - worker 崩溃恢复通过 Redis Streams pending recovery 和 Postgres running timeout recovery 共同处理。
 - MVP 暂不实现 RabbitMQ、NATS、Kafka 后端。
 - MVP 暂不实现复杂 Web 管理后台、DAG 工作流、多租户和生产级分片调度。
+- `tasks` 表新增可空 `trace_id TEXT` 列用于日志关联；trace_id 在任务首次创建时生成（若调用方未提供），后续重试不会改变 trace_id；不在 trace_id 上建索引。
+- Redis Stream 消息体新增 `trace_id` 字段；scheduler 投递重试任务时复用 Postgres 中已存的 trace_id。
+- HTTP API 创建任务请求体新增可选 `trace_id` 字段，返回体新增 `trace_id` 字段；外部调用方可传入自有 trace_id 以贯通跨服务追踪链路。
+- 启用 mvp.md §7 标为 optional 的 `tasks:dead` Redis Stream；任务进入 `dead` 状态时由 worker / scheduler 失败链路写入死信流，消息体包含 `task_id`、`task_type`、`trace_id`、`last_error`、`retry_count`，不包含完整 payload（payload 可由消费方按 task_id 回查 Postgres）。
+- 死信流名通过 `REDIS_DEAD_STREAM_NAME` 配置，默认 `tasks:dead`。
+- 死信流写入失败仅记 warn 日志，不影响任务在 Postgres 的 `dead` 状态终态；at-least-once 语义不扩展到死信流，运维侧消费者需要自行处理重复消息。
 
 ## 设计方案入口
 

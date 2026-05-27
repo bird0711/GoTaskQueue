@@ -8,8 +8,9 @@ import (
 )
 
 type TaskMessage struct {
-	ID   string
-	Type string
+	ID      string
+	Type    string
+	TraceID string
 }
 
 type RedisStreamPublisher struct {
@@ -25,12 +26,16 @@ func NewRedisStreamPublisher(client *redis.Client, streamName string) *RedisStre
 }
 
 func (p *RedisStreamPublisher) PublishTask(ctx context.Context, message TaskMessage) error {
+	values := map[string]any{
+		"task_id":   message.ID,
+		"task_type": message.Type,
+	}
+	if message.TraceID != "" {
+		values["trace_id"] = message.TraceID
+	}
 	_, err := p.client.XAdd(ctx, &redis.XAddArgs{
 		Stream: p.streamName,
-		Values: map[string]any{
-			"task_id":   message.ID,
-			"task_type": message.Type,
-		},
+		Values: values,
 	}).Result()
 	if err != nil {
 		return fmt.Errorf("publish task %s to redis stream %s: %w", message.ID, p.streamName, err)

@@ -14,3 +14,18 @@
 - 2026-05-16：实现 Redis Streams pending recovery；Worker 会周期 claim 超过 idle 时间的 pending 消息，并对终态任务重复消息直接 ack。
 - 2026-05-16：实现 Prometheus `/metrics` 暴露和基础 `gotaskqueue_*` 指标，覆盖任务生命周期计数、耗时 summary、队列积压和 running 数量 gauge。
 - 2026-05-16：实现简单只读 dashboard；HTTP 根路径和 `/dashboard` 展示任务概览、状态计数、队列/running 快照及最近失败/dead 任务。
+- 2026-05-16：添加基础验证入口和 CI；`make verify` 聚合 `go test ./...` 与 `go vet ./...`，GitHub Actions 在 push/pull request 执行同样检查。
+- 2026-05-16：统一本地验证入口为 `make check`，加入 golangci-lint 配置、常用 Makefile 命令、基于 `make check` 的 CI，以及 MVP 手动验收文档。
+- 2026-05-16：完成 MVP 收尾验收；确认 `docs/next.md` 可读，`make check` 通过，手动验证立即任务、短延迟任务、dashboard、`/metrics` 和 Prometheus 查询均通过。
+- 2026-05-18：实现任务提交幂等语义；重复 `idempotency_key` 提交会返回已有任务，不重复创建记录或投递 Redis Stream，并补充手动验收文档。
+- 2026-05-18：使用 Redis ZSET `tasks:scheduled` 实现延迟任务调度；创建 scheduled 任务会写入 ZSET，Scheduler 从 ZSET 取到期任务并经 Postgres 状态确认后投递 Redis Stream。
+- 2026-05-18：实现 Postgres running timeout recovery；Scheduler 会恢复超时 running 任务并进入 retrying/dead，同时修正 dead 决策的 retry_count 不超过数据库约束上限。
+- 2026-05-18：实现 migration 版本管理；`make migrate-up` 会创建 `schema_migrations`，按文件顺序执行未记录的 `*.up.sql` 并跳过已执行版本。
+- 2026-05-18：完成第二版最终验收；确认 `make check` 通过，重复 `make migrate-up` 会跳过已记录 migration，幂等提交返回同一任务，Redis ZSET 延迟任务写入 `tasks:scheduled` 并可调度成功，dashboard、`/metrics` 和 Prometheus 查询均可用。
+- 2026-05-26：实现真实 task handler 注册机制；Worker 可按 `task_type` 分发到已注册 handler，新增示例 handler `demo.echo`，未注册类型会进入现有失败/重试/死信链路，并补充单元测试与手动验收文档。
+- 2026-05-26：添加核心任务链路集成测试入口；新增 `integration` tag 测试和 `make integration-test`，覆盖立即任务、延迟任务、幂等提交、未知 `task_type` 失败链路，并补充本地执行说明。
+- 2026-05-26：增强只读 dashboard 排查能力；新增最近任务列表、任务详情页，以及最近失败/dead 任务到详情页的链接，并补充对应 HTTP 测试。
+- 2026-05-27：实现 worker 进程内并发执行；新增 `WORKER_CONCURRENCY` 配置（默认 4），使用 `chan struct{}` 信号量 + `sync.WaitGroup` 控制并发与停止时的 in-flight 等待；补充并发上限和取消等待两项单元测试，`make check` 与 `make integration-test` 通过。
+- 2026-05-27：补全 graceful shutdown；`internal/app/app.go` 引入 `runCtx` + `waitForRunner` helper，shutdown 阶段等 server/worker/scheduler 三个 goroutine 全部退出（或达到 10 秒上限）后再让 deferred `deps.Close` 触发；新增 `internal/app/app_test.go` 覆盖 helper 的正常退出、`http.ErrServerClosed` 和超时三条路径，`make check` 与 `make integration-test` 通过。
+- 2026-05-27：实现 trace_id 端到端贯通；新增 migration `000002_add_trace_id` 添加 `tasks.trace_id TEXT` 可空列；service 在创建任务时若调用方未提供则生成 `trace_` 前缀 hex trace_id，重试场景 scheduler 复用 Postgres 中已存的 trace_id；Redis Stream 消息 values 携带 trace_id 字段（缺失时向后兼容）；worker 任务生命周期日志全部带上 trace_id；HTTP API 请求与响应均新增可选 `trace_id` 字段；补充 service / queue 单元测试与集成测试断言，`make check` 与 `make integration-test` 通过。
+- 2026-05-27：启用 `tasks:dead` Redis Stream（mvp.md §7 标为 optional 的死信流）；新增 `RedisDeadStreamPublisher` 与 `REDIS_DEAD_STREAM_NAME` 配置（默认 `tasks:dead`），worker 与 scheduler 的失败链路在任务进入 `dead` 时写入死信流，消息体含 task_id/task_type/trace_id/last_error/retry_count；publish 失败仅记 warn，不影响任务终态与 stream ack；补充 worker / scheduler 单元测试与集成测试断言，`make check` 与 `make integration-test` 通过。

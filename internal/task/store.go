@@ -22,6 +22,7 @@ type CreateTaskParams struct {
 	Type           string
 	Payload        json.RawMessage
 	IdempotencyKey *string
+	TraceID        *string
 	RunAt          time.Time
 	TimeoutSeconds int
 	MaxRetries     int
@@ -47,29 +48,59 @@ func (s *Store) Create(ctx context.Context, params CreateTaskParams) (*Task, err
 		Payload:        params.Payload,
 		Status:         status,
 		IdempotencyKey: params.IdempotencyKey,
+		TraceID:        params.TraceID,
 		RunAt:          params.RunAt,
 		TimeoutSeconds: params.TimeoutSeconds,
 		MaxRetries:     params.MaxRetries,
 	}
 
 	row := s.db.QueryRow(ctx, `
-		INSERT INTO tasks (
-			id,
-			task_type,
-			payload,
-			status,
-			idempotency_key,
-			run_at,
-			timeout_seconds,
-			max_retries
+		WITH inserted AS (
+			INSERT INTO tasks (
+				id,
+				task_type,
+				payload,
+				status,
+				idempotency_key,
+				trace_id,
+				run_at,
+				timeout_seconds,
+				max_retries
+			)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (idempotency_key)
+				WHERE idempotency_key IS NOT NULL
+				DO NOTHING
+			RETURNING
+				id,
+				task_type,
+				payload,
+				status,
+				idempotency_key,
+				trace_id,
+				run_at,
+				timeout_seconds,
+				max_retries,
+				retry_count,
+				next_retry_at,
+				last_error,
+				worker_id,
+				started_at,
+				finished_at,
+				created_at,
+				updated_at,
+				TRUE AS newly_created
 		)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		RETURNING
+		SELECT *
+		FROM inserted
+		UNION ALL
+		SELECT
 			id,
 			task_type,
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -80,10 +111,15 @@ func (s *Store) Create(ctx context.Context, params CreateTaskParams) (*Task, err
 			started_at,
 			finished_at,
 			created_at,
-			updated_at
-	`, task.ID, task.Type, task.Payload, task.Status, task.IdempotencyKey, task.RunAt, task.TimeoutSeconds, task.MaxRetries)
+			updated_at,
+			FALSE AS newly_created
+		FROM tasks
+		WHERE $5 IS NOT NULL
+			AND idempotency_key = $5
+			AND NOT EXISTS (SELECT 1 FROM inserted)
+	`, task.ID, task.Type, task.Payload, task.Status, task.IdempotencyKey, task.TraceID, task.RunAt, task.TimeoutSeconds, task.MaxRetries)
 
-	return scanTask(row)
+	return scanTaskWithCreationFlag(row)
 }
 
 func (s *Store) Get(ctx context.Context, id string) (*Task, error) {
@@ -94,6 +130,7 @@ func (s *Store) Get(ctx context.Context, id string) (*Task, error) {
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -124,6 +161,7 @@ func (s *Store) DueDispatchable(ctx context.Context, now time.Time, limit int) (
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -168,6 +206,100 @@ func (s *Store) DueDispatchable(ctx context.Context, now time.Time, limit int) (
 
 func (s *Store) DueScheduled(ctx context.Context, now time.Time, limit int) ([]*Task, error) {
 	return s.DueDispatchable(ctx, now, limit)
+}
+
+func (s *Store) DueRetrying(ctx context.Context, now time.Time, limit int) ([]*Task, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			id,
+			task_type,
+			payload,
+			status,
+			idempotency_key,
+			trace_id,
+			run_at,
+			timeout_seconds,
+			max_retries,
+			retry_count,
+			next_retry_at,
+			last_error,
+			worker_id,
+			started_at,
+			finished_at,
+			created_at,
+			updated_at
+		FROM tasks
+		WHERE status = 'retrying'
+			AND next_retry_at IS NOT NULL
+			AND next_retry_at <= $1
+		ORDER BY next_retry_at ASC, created_at ASC
+		LIMIT $2
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+func (s *Store) ExpiredRunning(ctx context.Context, now time.Time, limit int) ([]*Task, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			id,
+			task_type,
+			payload,
+			status,
+			idempotency_key,
+			trace_id,
+			run_at,
+			timeout_seconds,
+			max_retries,
+			retry_count,
+			next_retry_at,
+			last_error,
+			worker_id,
+			started_at,
+			finished_at,
+			created_at,
+			updated_at
+		FROM tasks
+		WHERE status = 'running'
+			AND started_at IS NOT NULL
+			AND started_at + (timeout_seconds * INTERVAL '1 second') <= $1
+		ORDER BY started_at ASC, created_at ASC
+		LIMIT $2
+	`, now, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
 }
 
 func (s *Store) MetricsSnapshot(ctx context.Context, now time.Time) (metrics.Snapshot, error) {
@@ -224,6 +356,7 @@ func (s *Store) RecentByStatus(ctx context.Context, status Status, limit int) ([
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -240,6 +373,50 @@ func (s *Store) RecentByStatus(ctx context.Context, status Status, limit int) ([
 		ORDER BY updated_at DESC, created_at DESC
 		LIMIT $2
 	`, status, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var tasks []*Task
+	for rows.Next() {
+		task, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		tasks = append(tasks, task)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return tasks, nil
+}
+
+func (s *Store) Recent(ctx context.Context, limit int) ([]*Task, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT
+			id,
+			task_type,
+			payload,
+			status,
+			idempotency_key,
+			trace_id,
+			run_at,
+			timeout_seconds,
+			max_retries,
+			retry_count,
+			next_retry_at,
+			last_error,
+			worker_id,
+			started_at,
+			finished_at,
+			created_at,
+			updated_at
+		FROM tasks
+		ORDER BY updated_at DESC, created_at DESC
+		LIMIT $1
+	`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -282,6 +459,7 @@ func (s *Store) Transition(ctx context.Context, id string, from Status, to Statu
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -317,6 +495,7 @@ func (s *Store) MarkFailed(ctx context.Context, id string, failure string) (*Tas
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -359,6 +538,7 @@ func (s *Store) CompleteFailure(ctx context.Context, id string, decision Failure
 			payload,
 			status,
 			idempotency_key,
+			trace_id,
 			run_at,
 			timeout_seconds,
 			max_retries,
@@ -383,6 +563,10 @@ type taskRow interface {
 	Scan(dest ...any) error
 }
 
+type taskRowWithCreationFlag interface {
+	Scan(dest ...any) error
+}
+
 func scanTask(row taskRow) (*Task, error) {
 	var task Task
 	if err := row.Scan(
@@ -391,6 +575,7 @@ func scanTask(row taskRow) (*Task, error) {
 		&task.Payload,
 		&task.Status,
 		&task.IdempotencyKey,
+		&task.TraceID,
 		&task.RunAt,
 		&task.TimeoutSeconds,
 		&task.MaxRetries,
@@ -402,6 +587,33 @@ func scanTask(row taskRow) (*Task, error) {
 		&task.FinishedAt,
 		&task.CreatedAt,
 		&task.UpdatedAt,
+	); err != nil {
+		return nil, err
+	}
+	return &task, nil
+}
+
+func scanTaskWithCreationFlag(row taskRowWithCreationFlag) (*Task, error) {
+	var task Task
+	if err := row.Scan(
+		&task.ID,
+		&task.Type,
+		&task.Payload,
+		&task.Status,
+		&task.IdempotencyKey,
+		&task.TraceID,
+		&task.RunAt,
+		&task.TimeoutSeconds,
+		&task.MaxRetries,
+		&task.RetryCount,
+		&task.NextRetryAt,
+		&task.LastError,
+		&task.WorkerID,
+		&task.StartedAt,
+		&task.FinishedAt,
+		&task.CreatedAt,
+		&task.UpdatedAt,
+		&task.NewlyCreated,
 	); err != nil {
 		return nil, err
 	}

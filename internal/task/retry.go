@@ -13,7 +13,7 @@ func DecideFailure(now time.Time, retryCount int, maxRetries int) FailureDecisio
 	if nextRetryCount > maxRetries {
 		return FailureDecision{
 			Status:     StatusDead,
-			RetryCount: nextRetryCount,
+			RetryCount: maxRetries,
 		}
 	}
 

@@ -10,7 +10,9 @@ type Task struct {
 	Type           string
 	Payload        json.RawMessage
 	Status         Status
+	NewlyCreated   bool
 	IdempotencyKey *string
+	TraceID        *string
 	RunAt          time.Time
 	TimeoutSeconds int
 	MaxRetries     int

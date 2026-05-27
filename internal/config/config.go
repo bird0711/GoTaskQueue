@@ -8,6 +8,7 @@ type Config struct {
 	Postgres   PostgresConfig
 	Prometheus PrometheusConfig
 	Scheduler  SchedulerConfig
+	Worker     WorkerConfig
 }
 
 type HTTPConfig struct {
@@ -15,10 +16,12 @@ type HTTPConfig struct {
 }
 
 type RedisConfig struct {
-	Addr          string
-	StreamName    string
-	ConsumerGroup string
-	ConsumerName  string
+	Addr            string
+	StreamName      string
+	ScheduledSetKey string
+	DeadStreamName  string
+	ConsumerGroup   string
+	ConsumerName    string
 }
 
 type PostgresConfig struct {
@@ -39,16 +42,22 @@ type SchedulerConfig struct {
 	BatchSize       int
 }
 
+type WorkerConfig struct {
+	Concurrency int
+}
+
 func Load() Config {
 	return Config{
 		HTTP: HTTPConfig{
 			Addr: env("HTTP_ADDR", ":8080"),
 		},
 		Redis: RedisConfig{
-			Addr:          env("REDIS_ADDR", "localhost:6380"),
-			StreamName:    env("REDIS_STREAM_NAME", "tasks:stream"),
-			ConsumerGroup: env("REDIS_CONSUMER_GROUP", "gotaskqueue-workers"),
-			ConsumerName:  env("REDIS_CONSUMER_NAME", "gotaskqueue-worker-1"),
+			Addr:            env("REDIS_ADDR", "localhost:6380"),
+			StreamName:      env("REDIS_STREAM_NAME", "tasks:stream"),
+			ScheduledSetKey: env("REDIS_SCHEDULED_SET_KEY", "tasks:scheduled"),
+			DeadStreamName:  env("REDIS_DEAD_STREAM_NAME", "tasks:dead"),
+			ConsumerGroup:   env("REDIS_CONSUMER_GROUP", "gotaskqueue-workers"),
+			ConsumerName:    env("REDIS_CONSUMER_NAME", "gotaskqueue-worker-1"),
 		},
 		Postgres: PostgresConfig{
 			Host:     env("POSTGRES_HOST", "localhost"),
@@ -64,6 +73,9 @@ func Load() Config {
 		Scheduler: SchedulerConfig{
 			IntervalSeconds: envInt("SCHEDULER_INTERVAL_SECONDS", 2),
 			BatchSize:       envInt("SCHEDULER_BATCH_SIZE", 100),
+		},
+		Worker: WorkerConfig{
+			Concurrency: envInt("WORKER_CONCURRENCY", 4),
 		},
 	}
 }

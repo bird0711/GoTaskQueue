@@ -137,13 +137,15 @@ func streamMessageFromRedis(message redis.XMessage, recovered bool) (StreamMessa
 	if !ok || taskType == "" {
 		return StreamMessage{}, fmt.Errorf("redis message %s missing task_type", message.ID)
 	}
+	traceID, _ := stringValue(message.Values["trace_id"])
 
 	return StreamMessage{
 		RedisID:   message.ID,
 		Recovered: recovered,
 		Task: TaskMessage{
-			ID:   taskID,
-			Type: taskType,
+			ID:      taskID,
+			Type:    taskType,
+			TraceID: traceID,
 		},
 	}, nil
 }

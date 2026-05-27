@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"net"
 	"net/http"
 
 	"github.com/bird0711/GoTaskQueue/internal/metrics"
@@ -34,6 +35,7 @@ func New(cfg Config, tasks TaskStore, registry *metrics.Registry) *Server {
 	})
 	mux.HandleFunc("GET /", server.handleDashboard)
 	mux.HandleFunc("GET /dashboard", server.handleDashboard)
+	mux.HandleFunc("GET /dashboard/tasks/{id}", server.handleDashboardTaskDetail)
 	mux.HandleFunc("POST /tasks", server.handleCreateTask)
 	mux.HandleFunc("GET /tasks/{id}", server.handleGetTask)
 	if registry != nil {
@@ -45,6 +47,10 @@ func New(cfg Config, tasks TaskStore, registry *metrics.Registry) *Server {
 
 func (s *Server) Run() error {
 	return s.httpServer.ListenAndServe()
+}
+
+func (s *Server) RunListener(listener net.Listener) error {
+	return s.httpServer.Serve(listener)
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {

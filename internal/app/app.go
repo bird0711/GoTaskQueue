@@ -17,6 +17,8 @@ import (
 	"github.com/bird0711/GoTaskQueue/internal/worker"
 )
 
+const shutdownTimeout = 10 * time.Second
+
 // App wires top-level components without attaching infrastructure yet.
 type App struct {
 	config config.Config
@@ -41,9 +43,12 @@ func (a *App) Run(ctx context.Context) error {
 	taskStore := task.NewStore(deps.Postgres)
 	metricsRegistry := metrics.NewRegistry().WithSnapshotProvider(taskStore)
 	streamPublisher := queue.NewRedisStreamPublisher(deps.Redis, a.config.Redis.StreamName)
+	scheduledQueue := queue.NewRedisScheduledQueue(deps.Redis, a.config.Redis.ScheduledSetKey)
+	deadPublisher := queue.NewRedisDeadStreamPublisher(deps.Redis, a.config.Redis.DeadStreamName)
 	taskService := task.NewService(
 		taskStore,
 		streamPublisher,
+		scheduledQueue,
 	).WithMetrics(metricsRegistry)
 	a.server = httpserver.New(httpserver.Config{
 		Addr: a.config.HTTP.Addr,
@@ -55,14 +60,26 @@ func (a *App) Run(ctx context.Context) error {
 		a.config.Redis.ConsumerName,
 		5*time.Second,
 	)
-	workerRunner := worker.New(streamConsumer, taskStore, a.logger, a.config.Redis.ConsumerName).WithMetrics(metricsRegistry)
+	handlerRegistry := worker.NewHandlerRegistry()
+	if err := handlerRegistry.Register("demo.echo", worker.DemoEchoHandler{Logger: a.logger}); err != nil {
+		return err
+	}
+	workerRunner := worker.New(streamConsumer, taskStore, a.logger, a.config.Redis.ConsumerName).
+		WithHandlerRegistry(handlerRegistry).
+		WithConcurrency(a.config.Worker.Concurrency).
+		WithMetrics(metricsRegistry).
+		WithDeadPublisher(deadPublisher)
 	schedulerRunner := scheduler.New(
 		taskStore,
 		streamPublisher,
+		scheduledQueue,
 		a.logger,
 		time.Duration(a.config.Scheduler.IntervalSeconds)*time.Second,
 		a.config.Scheduler.BatchSize,
-	)
+	).WithDeadPublisher(deadPublisher)
+
+	runCtx, cancelRunners := context.WithCancel(ctx)
+	defer cancelRunners()
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -71,43 +88,71 @@ func (a *App) Run(ctx context.Context) error {
 	}()
 	workerErr := make(chan error, 1)
 	go func() {
-		workerErr <- workerRunner.Run(ctx)
+		workerErr <- workerRunner.Run(runCtx)
 	}()
 	schedulerErr := make(chan error, 1)
 	go func() {
-		schedulerErr <- schedulerRunner.Run(ctx)
+		schedulerErr <- schedulerRunner.Run(runCtx)
 	}()
+
+	var earlyErr error
+	serverDone, workerDone, schedulerDone := false, false, false
 
 	select {
 	case <-ctx.Done():
 		a.logger.Info("shutdown requested")
 	case err := <-serverErr:
-		if err == nil || errors.Is(err, http.ErrServerClosed) {
-			return nil
+		serverDone = true
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			earlyErr = err
 		}
-		return err
+		a.logger.Info("server runner exited", "error", err)
 	case err := <-workerErr:
+		workerDone = true
 		if err != nil {
-			return err
+			earlyErr = err
 		}
+		a.logger.Info("worker runner exited", "error", err)
 	case err := <-schedulerErr:
+		schedulerDone = true
 		if err != nil {
-			return err
+			earlyErr = err
 		}
+		a.logger.Info("scheduler runner exited", "error", err)
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+	cancelRunners()
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancelShutdown()
 
 	if err := a.server.Shutdown(shutdownCtx); err != nil {
-		return err
+		a.logger.Warn("server shutdown returned error", "error", err)
 	}
 
-	err = <-serverErr
-	if err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	if !serverDone {
+		waitForRunner(shutdownCtx, "server", serverErr, a.logger)
+	}
+	if !workerDone {
+		waitForRunner(shutdownCtx, "worker", workerErr, a.logger)
+	}
+	if !schedulerDone {
+		waitForRunner(shutdownCtx, "scheduler", schedulerErr, a.logger)
 	}
 
 	a.logger.Info("application shutdown complete")
-	return nil
+	return earlyErr
+}
+
+func waitForRunner(ctx context.Context, name string, errCh <-chan error, logger *slog.Logger) {
+	select {
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warn("runner exited with error during shutdown", "runner", name, "error", err)
+			return
+		}
+		logger.Info("runner exited", "runner", name)
+	case <-ctx.Done():
+		logger.Warn("timeout waiting for runner to exit", "runner", name)
+	}
 }

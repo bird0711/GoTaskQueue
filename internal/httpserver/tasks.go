@@ -18,12 +18,14 @@ type TaskStore interface {
 	MetricsSnapshot(context.Context, time.Time) (metrics.Snapshot, error)
 	CountByStatus(context.Context) (map[task.Status]int64, error)
 	RecentByStatus(context.Context, task.Status, int) ([]*task.Task, error)
+	Recent(context.Context, int) ([]*task.Task, error)
 }
 
 type createTaskRequest struct {
 	TaskType       string          `json:"task_type"`
 	Payload        json.RawMessage `json:"payload"`
 	IdempotencyKey *string         `json:"idempotency_key"`
+	TraceID        *string         `json:"trace_id"`
 	RunAt          *time.Time      `json:"run_at"`
 	TimeoutSeconds int             `json:"timeout_seconds"`
 	MaxRetries     int             `json:"max_retries"`
@@ -35,6 +37,7 @@ type taskResponse struct {
 	Payload        json.RawMessage `json:"payload"`
 	Status         task.Status     `json:"status"`
 	IdempotencyKey *string         `json:"idempotency_key,omitempty"`
+	TraceID        *string         `json:"trace_id,omitempty"`
 	RunAt          time.Time       `json:"run_at"`
 	TimeoutSeconds int             `json:"timeout_seconds"`
 	MaxRetries     int             `json:"max_retries"`
@@ -118,6 +121,14 @@ func validateCreateTaskRequest(req createTaskRequest) (task.CreateTaskParams, er
 		req.IdempotencyKey = &key
 	}
 
+	if req.TraceID != nil {
+		traceID := strings.TrimSpace(*req.TraceID)
+		if traceID == "" {
+			return task.CreateTaskParams{}, errors.New("trace_id cannot be blank")
+		}
+		req.TraceID = &traceID
+	}
+
 	runAt := time.Now().UTC()
 	if req.RunAt != nil {
 		runAt = req.RunAt.UTC()
@@ -143,6 +154,7 @@ func validateCreateTaskRequest(req createTaskRequest) (task.CreateTaskParams, er
 		Type:           taskType,
 		Payload:        payload,
 		IdempotencyKey: req.IdempotencyKey,
+		TraceID:        req.TraceID,
 		RunAt:          runAt,
 		TimeoutSeconds: timeoutSeconds,
 		MaxRetries:     maxRetries,
@@ -156,6 +168,7 @@ func toTaskResponse(task *task.Task) taskResponse {
 		Payload:        task.Payload,
 		Status:         task.Status,
 		IdempotencyKey: task.IdempotencyKey,
+		TraceID:        task.TraceID,
 		RunAt:          task.RunAt,
 		TimeoutSeconds: task.TimeoutSeconds,
 		MaxRetries:     task.MaxRetries,

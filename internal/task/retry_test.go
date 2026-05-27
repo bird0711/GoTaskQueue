@@ -30,8 +30,8 @@ func TestDecideFailureDeadAfterMaxRetries(t *testing.T) {
 	if decision.Status != StatusDead {
 		t.Fatalf("expected dead, got %q", decision.Status)
 	}
-	if decision.RetryCount != 4 {
-		t.Fatalf("expected retry count 4, got %d", decision.RetryCount)
+	if decision.RetryCount != 3 {
+		t.Fatalf("expected retry count 3, got %d", decision.RetryCount)
 	}
 	if decision.NextRetryAt != nil {
 		t.Fatalf("expected nil next retry at, got %s", decision.NextRetryAt)
