@@ -50,6 +50,7 @@
 - `internal/app/app.go` 已补全 graceful shutdown；shutdown 阶段会等待 server / worker / scheduler 三个 goroutine 全部退出（或达到 10 秒上限）后再触发 `deps.Close`，相关逻辑提取为 `waitForRunner` helper 并有单元测试覆盖正常退出、`http.ErrServerClosed`、超时三条路径。
 - `tasks` 表新增可空 `trace_id TEXT` 列（migration `000002_add_trace_id`）；trace_id 在任务创建时由 service 自动生成（`trace_` 前缀 hex），调用方可通过请求体覆盖；scheduler 重试投递时复用 Postgres 中已存的 trace_id；Redis Stream 消息体包含 trace_id；worker 任务生命周期日志带上 trace_id；HTTP API 请求/响应都新增可选 `trace_id` 字段。
 - 已启用 `tasks:dead` Redis Stream（流名通过 `REDIS_DEAD_STREAM_NAME` 配置，默认 `tasks:dead`）；任务进入 `dead` 状态时 worker 与 scheduler 失败链路写入死信流，消息体含 `task_id`、`task_type`、`trace_id`、`last_error`、`retry_count`，不含完整 payload；publish 失败仅记 warn，不影响任务终态、stream ack 或 metrics。
+- MVP 3.0 阶段验收已通过：`make check`、`make integration-test`、dashboard 任务详情页、trace_id API/Redis Stream/日志贯通、`tasks:dead` 死信流、`WORKER_CONCURRENCY` 并发配置和 graceful shutdown 均验证通过。
 
 ## 已知问题
 

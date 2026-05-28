@@ -67,6 +67,13 @@ After completing the task:
 
 Small changes do not need to be recorded in `docs/status.md` or `docs/log.md`.
 
+## Document Maintenance
+
+- Keep `docs/next.md` specific enough for execution, including scope, non-goals, and completion criteria.
+- Periodically compact `docs/status.md` when it becomes historical rather than current-state focused.
+- Do not record small implementation details in `docs/log.md` unless they are useful for future debugging, handoff, or release history.
+- Do not write assumptions into `docs/decisions.md` as decisions. Mark unresolved items as open questions elsewhere or leave them out.
+
 ## Final Response
 
 Report:

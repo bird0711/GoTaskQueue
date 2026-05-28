@@ -34,3 +34,6 @@ go.work.sum
 postgres-data/
 redis-data/
 prometheus-data/
+
+# Claude
+.claude/
