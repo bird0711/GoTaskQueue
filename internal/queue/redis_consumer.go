@@ -45,30 +45,42 @@ func (c *RedisStreamConsumer) EnsureGroup(ctx context.Context) error {
 }
 
 func (c *RedisStreamConsumer) Read(ctx context.Context) (StreamMessage, error) {
+	messages, err := c.ReadBatch(ctx, 1)
+	if err != nil {
+		return StreamMessage{}, err
+	}
+	return messages[0], nil
+}
+
+func (c *RedisStreamConsumer) ReadBatch(ctx context.Context, count int64) ([]StreamMessage, error) {
+	if count <= 0 {
+		count = 1
+	}
+
 	streams, err := c.client.XReadGroup(ctx, &redis.XReadGroupArgs{
 		Group:    c.groupName,
 		Consumer: c.consumer,
 		Streams:  []string{c.streamName, ">"},
-		Count:    1,
+		Count:    count,
 		Block:    c.block,
 	}).Result()
 	if errors.Is(err, redis.Nil) {
-		return StreamMessage{}, ErrNoMessages
+		return nil, ErrNoMessages
 	}
 	if isNoGroup(err) {
 		if groupErr := c.EnsureGroup(ctx); groupErr != nil {
-			return StreamMessage{}, groupErr
+			return nil, groupErr
 		}
-		return StreamMessage{}, ErrNoMessages
+		return nil, ErrNoMessages
 	}
 	if err != nil {
-		return StreamMessage{}, fmt.Errorf("read redis stream %s: %w", c.streamName, err)
+		return nil, fmt.Errorf("read redis stream %s: %w", c.streamName, err)
 	}
 	if len(streams) == 0 || len(streams[0].Messages) == 0 {
-		return StreamMessage{}, ErrNoMessages
+		return nil, ErrNoMessages
 	}
 
-	return streamMessageFromRedis(streams[0].Messages[0], false)
+	return streamMessagesFromRedis(streams[0].Messages, false)
 }
 
 func (c *RedisStreamConsumer) ClaimPending(ctx context.Context, minIdle time.Duration, count int64) ([]StreamMessage, error) {
@@ -118,6 +130,18 @@ func (c *RedisStreamConsumer) ClaimPending(ctx context.Context, minIdle time.Dur
 		messages = append(messages, message)
 	}
 
+	return messages, nil
+}
+
+func streamMessagesFromRedis(redisMessages []redis.XMessage, recovered bool) ([]StreamMessage, error) {
+	messages := make([]StreamMessage, 0, len(redisMessages))
+	for _, redisMessage := range redisMessages {
+		message, err := streamMessageFromRedis(redisMessage, recovered)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, message)
+	}
 	return messages, nil
 }
 

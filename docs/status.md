@@ -33,6 +33,7 @@
 - Scheduler 会周期恢复超过 `started_at + timeout_seconds` 的 running 任务，将其接入失败处理链路并转为 `retrying` 或 `dead`。
 - Worker 已支持按 `task_type` 注册和分发真实 task handler。
 - 应用启动时已注册示例 handler `demo.echo`；未注册的 `task_type` 会返回明确错误并进入现有失败/重试/死信链路。
+- 应用启动时已注册真实业务示例 handler `webhook.deliver`；payload 包含 `url`、`method`、`headers`、`body`，handler 使用 Go HTTP client 发起请求，2xx 成功，4xx、无效 payload、字段类型错误、未知 task_type 等不可重试错误直接进入 `dead`，5xx、网络错误和超时作为可重试错误接入现有 retry/dead 链路。
 - Go HTTP Server 已暴露 `/metrics`，提供 `gotaskqueue_*` 前缀的基础 Prometheus 指标。
 - 核心任务生命周期已接入提交、开始、成功、失败、重试、死信计数，以及任务执行耗时和等待耗时指标。
 - `/metrics` 会基于 Postgres 当前状态提供队列积压和 running 任务数量 gauge。
@@ -50,10 +51,12 @@
 - `make migrate-up` 已支持 `schema_migrations` 版本记录，会按文件顺序执行未执行的 `migrations/*.up.sql` 并跳过已记录版本。
 - 第二版最终验收已通过：`make check`、幂等提交、Redis ZSET 延迟任务、running timeout recovery、重复 `make migrate-up`、dashboard、应用 metrics 和 Prometheus 查询均验证通过。
 - Worker 已支持进程内并发执行；通过 `WORKER_CONCURRENCY`（默认 4）控制同时执行的任务数量，使用信号量 + `sync.WaitGroup`，`Run` 在 ctx 取消后等待所有 in-flight goroutine 退出再返回。
+- Worker Redis Stream 消费已支持批量读取；通过 `WORKER_BATCH_SIZE`（默认 10）控制每次轮询最多读取的消息数，批内每条消息仍复用现有状态流转、handler 分发、ack、失败、重试和死信链路，实际同时执行数量仍由 `WORKER_CONCURRENCY` 限制。
 - `internal/app/app.go` 已补全 graceful shutdown；shutdown 阶段会等待 server / worker / scheduler 三个 goroutine 全部退出（或达到 10 秒上限）后再触发 `deps.Close`，相关逻辑提取为 `waitForRunner` helper 并有单元测试覆盖正常退出、`http.ErrServerClosed`、超时三条路径。
 - `tasks` 表新增可空 `trace_id TEXT` 列（migration `000002_add_trace_id`）；trace_id 在任务创建时由 service 自动生成（`trace_` 前缀 hex），调用方可通过请求体覆盖；scheduler 重试投递时复用 Postgres 中已存的 trace_id；Redis Stream 消息体包含 trace_id；worker 任务生命周期日志带上 trace_id；HTTP API 请求/响应都新增可选 `trace_id` 字段。
 - 已启用 `tasks:dead` Redis Stream（流名通过 `REDIS_DEAD_STREAM_NAME` 配置，默认 `tasks:dead`）；任务进入 `dead` 状态时 worker 与 scheduler 失败链路写入死信流，消息体含 `task_id`、`task_type`、`trace_id`、`last_error`、`retry_count`，不含完整 payload；publish 失败仅记 warn，不影响任务终态、stream ack 或 metrics。
 - MVP 3.0 阶段验收已通过：`make check`、`make integration-test`、dashboard 任务详情页、trace_id API/Redis Stream/日志贯通、`tasks:dead` 死信流、`WORKER_CONCURRENCY` 并发配置和 graceful shutdown 均验证通过。
+- GoTaskQueue v1.0 最终验收已通过：`make up`、`make migrate-up`、`make check`、`make integration-test`、立即任务、延迟任务、`webhook.deliver` 成功/失败任务、unknown task type dead、dashboard、任务详情页、`/metrics`、Prometheus 查询和 `tasks:dead` 检查均验证通过。
 
 ## 已知问题
 

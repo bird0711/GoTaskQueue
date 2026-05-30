@@ -13,11 +13,14 @@ import (
 	"github.com/bird0711/GoTaskQueue/internal/task"
 )
 
-const defaultWorkerConcurrency = 4
+const (
+	defaultWorkerConcurrency = 4
+	defaultWorkerBatchSize   = 10
+)
 
 type Consumer interface {
 	EnsureGroup(context.Context) error
-	Read(context.Context) (queue.StreamMessage, error)
+	ReadBatch(context.Context, int64) ([]queue.StreamMessage, error)
 	ClaimPending(context.Context, time.Duration, int64) ([]queue.StreamMessage, error)
 	Ack(context.Context, string) error
 }
@@ -42,6 +45,7 @@ type Worker struct {
 	metrics             *metrics.Registry
 	deadPublisher       DeadPublisher
 	concurrency         int
+	batchSize           int64
 	sem                 chan struct{}
 	wg                  sync.WaitGroup
 	pendingMinIdle      time.Duration
@@ -58,6 +62,7 @@ func New(consumer Consumer, store TaskStore, logger *slog.Logger, name string) *
 		logger:      logger,
 		name:        name,
 		concurrency: defaultWorkerConcurrency,
+		batchSize:   defaultWorkerBatchSize,
 		sem:         make(chan struct{}, defaultWorkerConcurrency),
 
 		pendingMinIdle:      30 * time.Second,
@@ -70,6 +75,13 @@ func (w *Worker) WithConcurrency(n int) *Worker {
 	if n > 0 {
 		w.concurrency = n
 		w.sem = make(chan struct{}, n)
+	}
+	return w
+}
+
+func (w *Worker) WithBatchSize(n int) *Worker {
+	if n > 0 {
+		w.batchSize = int64(n)
 	}
 	return w
 }
@@ -102,7 +114,7 @@ func (w *Worker) Run(ctx context.Context) error {
 	if err := w.consumer.EnsureGroup(ctx); err != nil {
 		return err
 	}
-	w.logger.Info("worker started", "consumer", w.name, "concurrency", w.concurrency)
+	w.logger.Info("worker started", "consumer", w.name, "concurrency", w.concurrency, "batch_size", w.batchSize)
 
 	defer w.wg.Wait()
 
@@ -126,7 +138,7 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		}
 
-		message, err := w.consumer.Read(ctx)
+		messages, err := w.consumer.ReadBatch(ctx, w.batchSize)
 		if errors.Is(err, queue.ErrNoMessages) {
 			continue
 		}
@@ -140,11 +152,13 @@ func (w *Worker) Run(ctx context.Context) error {
 			continue
 		}
 
-		if !w.acquireSlot(ctx) {
-			w.logger.Info("worker stopping, waiting for in-flight tasks", "consumer", w.name)
-			return nil
+		for _, message := range messages {
+			if !w.acquireSlot(ctx) {
+				w.logger.Info("worker stopping, waiting for in-flight tasks", "consumer", w.name)
+				return nil
+			}
+			w.spawnHandle(ctx, message)
 		}
-		w.spawnHandle(ctx, message)
 	}
 }
 
@@ -292,6 +306,12 @@ func (w *Worker) handleExecutionFailure(ctx context.Context, runningTask *task.T
 	w.logger.Info("task failed", "task_id", failedTask.ID, "trace_id", traceID, "retry_count", failedTask.RetryCount, "max_retries", failedTask.MaxRetries, "error", failure)
 
 	decision := task.DecideFailure(time.Now().UTC(), failedTask.RetryCount, failedTask.MaxRetries)
+	if IsNonRetryable(executionErr) {
+		decision = task.FailureDecision{
+			Status:     task.StatusDead,
+			RetryCount: failedTask.RetryCount,
+		}
+	}
 	finalTask, err := w.store.CompleteFailure(ctx, failedTask.ID, decision, failure)
 	if err != nil {
 		return err

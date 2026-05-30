@@ -33,3 +33,9 @@
 - 2026-05-30：补充 README 总入口文档；覆盖项目定位、架构与任务流转、核心能力、本地启动、API 示例、dashboard、Prometheus、测试命令和后续优化方向，并确认 `make check` 通过。
 - 2026-05-30：优化 dashboard 查询索引并拆分 HTML 模板；新增 migration `000003_add_dashboard_query_indexes`，为最近任务与按状态最近任务查询建立排序索引，将 dashboard 页面模板拆到 `internal/httpserver/templates/` 并通过 Go embed 加载，确认 `make check` 和重复 `make migrate-up` 通过。
 - 2026-05-30：完成 dashboard 索引和模板拆分收尾验收；确认 `make check` 通过，在临时数据库验证 `000003_add_dashboard_query_indexes` 可首次执行且重复 `make migrate-up` 会跳过已记录 migration，并通过本地 HTTP 请求验证 `/dashboard` 和任务详情页正常渲染。
+- 2026-05-30：实现 Worker 批量消费 Redis Stream 消息；新增 `WORKER_BATCH_SIZE` 配置（默认 10），`ReadBatch` 使用 `XREADGROUP COUNT` 批量读取，Worker 按批调度但继续用 `WORKER_CONCURRENCY` 信号量限制实际并发；补充批量读取、并发上限、部分失败和终态重复消息 ack 单元测试。
+- 2026-05-30：完成 Worker 批量消费收尾验收；确认批量读取、`WORKER_CONCURRENCY` 并发上限、单条失败隔离、终态重复消息 ack 和 `WORKER_BATCH_SIZE` 配置文档一致，`make check` 与 `make integration-test` 通过。
+- 2026-05-30：实现真实业务示例 handler `webhook.deliver`；新增 webhook payload 解析、HTTP client 请求、handler 内部超时、2xx 成功、4xx/5xx/网络错误/超时错误返回，并在应用启动时注册；补充 httptest 单元测试覆盖成功、4xx、5xx、timeout、payload invalid，更新 README 示例，`make check` 通过。
+- 2026-05-30：补齐 handler payload 校验和错误分类；新增 `RetryableError` / `NonRetryableError`，worker 对不可重试错误直接完成为 `dead`，`webhook.deliver` 将无效 payload、字段类型错误和 4xx 归类为不可重试，将 5xx、网络错误和超时归类为可重试；补充 worker / handler 单元测试并更新 README，`make check` 通过。
+- 2026-05-30：整理 v1.0 演示文档；README 明确项目定位为 Go 异步任务队列中间件 / 后端基础设施组件，新增完整 v1.0 demo runbook、只读 dashboard 说明和面试讲解要点，并移除已完成能力的 Future Work 表述；确认 `docs/mvp.md`、`docs/status.md`、`docs/log.md` 与 README 无明显冲突，`make check` 通过。
+- 2026-05-30：完成 GoTaskQueue v1.0 最终验收；确认 `make up`、`make migrate-up`、`make check`、`make integration-test` 通过，启动应用后提交立即任务、延迟任务、`webhook.deliver` 成功任务、`webhook.deliver` 失败任务和 unknown task type dead 任务，验证 `/dashboard`、任务详情页、`/metrics`、Prometheus 查询和 `tasks:dead` 均正常；验收中将 unknown task type 归类为不可重试错误以避免无意义重试，相关测试补齐并通过。

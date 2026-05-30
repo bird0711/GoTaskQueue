@@ -70,7 +70,7 @@ func (r *HandlerRegistry) Handle(ctx context.Context, taskModel *task.Task) erro
 	handler, ok := r.handlers[taskType]
 	r.mu.RUnlock()
 	if !ok {
-		return UnknownTaskTypeError{TaskType: taskModel.Type}
+		return NonRetryable(UnknownTaskTypeError{TaskType: taskModel.Type})
 	}
 
 	return handler.Handle(ctx, taskModel)

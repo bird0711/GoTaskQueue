@@ -64,9 +64,13 @@ func (a *App) Run(ctx context.Context) error {
 	if err := handlerRegistry.Register("demo.echo", worker.DemoEchoHandler{Logger: a.logger}); err != nil {
 		return err
 	}
+	if err := handlerRegistry.Register("webhook.deliver", worker.WebhookDeliverHandler{}); err != nil {
+		return err
+	}
 	workerRunner := worker.New(streamConsumer, taskStore, a.logger, a.config.Redis.ConsumerName).
 		WithHandlerRegistry(handlerRegistry).
 		WithConcurrency(a.config.Worker.Concurrency).
+		WithBatchSize(a.config.Worker.BatchSize).
 		WithMetrics(metricsRegistry).
 		WithDeadPublisher(deadPublisher)
 	schedulerRunner := scheduler.New(

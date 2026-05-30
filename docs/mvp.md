@@ -411,3 +411,85 @@ MVP 完成后应能演示：
 - Prometheus 能看到关键指标。
 - dashboard 能看到任务状态和队列积压。
 
+## 18. 实习作品 v1.0 截止范围
+
+本项目作为 Go 后端实习作品时，最终版本应定位为：
+
+```text
+GoTaskQueue v1.0
+
+一个基于 Go + Redis Streams + Postgres 的异步任务队列中间件，
+支持任务提交、延迟调度、幂等、重试、超时、死信、trace_id、metrics、dashboard、
+worker 并发与批量消费，并提供一个真实业务 handler 示例。
+```
+
+v1.0 的目标不是继续扩展成完整网站或工作流平台，而是形成一个可运行、可演示、可解释设计取舍的后端基础设施项目。
+
+### 18.1 v1.0 必须完成
+
+- 完成并验收 Worker 批量消费 Redis Stream 消息：
+  - 支持 `WORKER_BATCH_SIZE` 配置。
+  - 每次轮询可读取多条 Redis Stream 消息。
+  - 实际同时执行任务数量仍由 `WORKER_CONCURRENCY` 限制。
+  - 批内单条任务失败不影响其他任务处理。
+  - 现有 ack、失败、重试、dead stream 链路保持不变。
+- 新增至少一个真实业务 handler 示例，建议优先实现 `webhook.deliver`：
+  - payload 包含目标 URL、请求方法、headers 和 body。
+  - 使用 Go HTTP client 调用外部服务。
+  - 支持请求超时。
+  - 5xx、网络错误和超时可进入重试。
+  - 明确区分可重试错误和不可重试错误。
+  - 使用 `httptest.Server` 补充 handler 单元测试。
+- 补齐 handler payload 校验：
+  - handler 负责将 JSON payload 解析为明确结构体。
+  - 缺少必要字段时返回清晰错误。
+  - 无效 payload 不应导致 panic。
+- 完成 v1.0 演示文档：
+  - 写清楚项目定位：异步任务队列中间件 / 后端基础设施组件。
+  - 提供一条完整演示路径：启动依赖、执行 migration、启动应用、提交任务、查看 dashboard、查看 metrics、制造失败任务。
+  - 说明 dashboard 是只读运维页面，不是完整网站。
+  - 说明 Prometheus 页面属于演示的一部分。
+- 完成 v1.0 验收：
+  - `make check` 通过。
+  - `make integration-test` 通过，或明确记录无法运行原因。
+  - README、`.env.example`、`docs/status.md`、`docs/log.md` 与最终能力一致。
+
+### 18.2 v1.0 演示形态
+
+v1.0 应按后端中间件项目演示，而不是按网站项目演示。
+
+演示组成：
+
+- 命令行 API 演示：
+  - 提交立即任务。
+  - 查询任务状态。
+  - 提交延迟任务。
+  - 提交失败任务并观察 retry / dead。
+  - 提交真实业务 handler 任务，例如 webhook delivery。
+- Dashboard 演示：
+  - `/dashboard` 任务总览页。
+  - `/dashboard/tasks/{id}` 任务详情页。
+- 监控演示：
+  - `/metrics` 原始指标。
+  - Prometheus 查询页面。
+
+### 18.3 v1.0 明确不做
+
+- 不做 RabbitMQ、NATS、Kafka 多后端抽象。
+- 不做复杂 Web 管理后台。
+- 不做完整网站或 SaaS 产品。
+- 不做用户登录、权限系统或多租户。
+- 不做 DAG 工作流。
+- 不做 Kubernetes 部署。
+- 不承诺 exactly-once delivery。
+- 不为了展示而引入过度封装。
+
+### 18.4 v1.0 完成后停止扩展
+
+达到 v1.0 后，项目应停止继续堆功能，将后续方向记录到 Future Work。实习投递版本应强调：
+
+- 核心异步任务链路完整。
+- 状态机、重试、死信、恢复路径清晰。
+- Go 并发、context、graceful shutdown 使用合理。
+- Redis 和 Postgres 的职责边界清楚。
+- 可观测性、测试、文档和本地演示闭环完整。

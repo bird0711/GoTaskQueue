@@ -30,6 +30,10 @@ func (c *fakeConsumer) Read(context.Context) (queue.StreamMessage, error) {
 	return queue.StreamMessage{}, queue.ErrNoMessages
 }
 
+func (c *fakeConsumer) ReadBatch(context.Context, int64) ([]queue.StreamMessage, error) {
+	return nil, queue.ErrNoMessages
+}
+
 func (c *fakeConsumer) ClaimPending(_ context.Context, minIdle time.Duration, batch int64) ([]queue.StreamMessage, error) {
 	c.claimMinIdle = minIdle
 	c.claimBatch = batch
@@ -299,6 +303,12 @@ func (failingHandler) Handle(context.Context, *task.Task) error {
 	return errors.New("execution failed")
 }
 
+type nonRetryableHandler struct{}
+
+func (nonRetryableHandler) Handle(context.Context, *task.Task) error {
+	return NonRetryable(errors.New("invalid request"))
+}
+
 func TestHandleMessageFailureTransitionsToRetryingAndAcks(t *testing.T) {
 	consumer := &fakeConsumer{}
 	store := &fakeTaskStore{
@@ -334,6 +344,47 @@ func TestHandleMessageFailureTransitionsToRetryingAndAcks(t *testing.T) {
 	}
 	if store.completeStatus != task.StatusRetrying {
 		t.Fatalf("expected retrying final status, got %q", store.completeStatus)
+	}
+	if len(consumer.acked) != 1 || consumer.acked[0] != "1-0" {
+		t.Fatalf("expected redis message ack, got %#v", consumer.acked)
+	}
+}
+
+func TestHandleMessageNonRetryableFailureTransitionsToDeadAndAcks(t *testing.T) {
+	consumer := &fakeConsumer{}
+	store := &fakeTaskStore{
+		runningTask: &task.Task{
+			ID:             "task_invalid",
+			Type:           "email.send",
+			Status:         task.StatusPending,
+			TimeoutSeconds: 30,
+			RetryCount:     0,
+			MaxRetries:     3,
+			CreatedAt:      time.Now().UTC(),
+		},
+	}
+	registry := NewHandlerRegistry()
+	if err := registry.Register("email.send", nonRetryableHandler{}); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+	worker := New(consumer, store, slog.Default(), "test-worker").WithHandlerRegistry(registry)
+
+	err := worker.handleMessage(context.Background(), queue.StreamMessage{
+		RedisID: "1-0",
+		Task: queue.TaskMessage{
+			ID:   "task_invalid",
+			Type: "email.send",
+		},
+	})
+	if err != nil {
+		t.Fatalf("handle message: %v", err)
+	}
+
+	if !store.markFailed {
+		t.Fatal("expected task to be marked failed")
+	}
+	if store.completeStatus != task.StatusDead {
+		t.Fatalf("expected dead final status, got %q", store.completeStatus)
 	}
 	if len(consumer.acked) != 1 || consumer.acked[0] != "1-0" {
 		t.Fatalf("expected redis message ack, got %#v", consumer.acked)
@@ -596,7 +647,7 @@ func TestHandleMessageTimeoutTransitionsToRetryingAndAcks(t *testing.T) {
 	}
 }
 
-func TestHandleMessageUnknownTaskTypeTransitionsToRetryingAndAcks(t *testing.T) {
+func TestHandleMessageUnknownTaskTypeTransitionsToDeadAndAcks(t *testing.T) {
 	consumer := &fakeConsumer{}
 	store := &fakeTaskStore{
 		runningTask: &task.Task{
@@ -627,8 +678,8 @@ func TestHandleMessageUnknownTaskTypeTransitionsToRetryingAndAcks(t *testing.T) 
 	if store.lastFailure != "no handler registered for task_type \"unknown.type\"" {
 		t.Fatalf("expected unknown task type failure message, got %q", store.lastFailure)
 	}
-	if store.completeStatus != task.StatusRetrying {
-		t.Fatalf("expected retrying final status, got %q", store.completeStatus)
+	if store.completeStatus != task.StatusDead {
+		t.Fatalf("expected dead final status, got %q", store.completeStatus)
 	}
 	if len(consumer.acked) != 1 || consumer.acked[0] != "1-0" {
 		t.Fatalf("expected redis message ack, got %#v", consumer.acked)
@@ -665,6 +716,31 @@ func (c *channelConsumer) Read(ctx context.Context) (queue.StreamMessage, error)
 		}
 		return message, nil
 	}
+}
+
+func (c *channelConsumer) ReadBatch(ctx context.Context, count int64) ([]queue.StreamMessage, error) {
+	if count <= 0 {
+		count = 1
+	}
+
+	first, err := c.Read(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	messages := []queue.StreamMessage{first}
+	for int64(len(messages)) < count {
+		select {
+		case message, ok := <-c.messages:
+			if !ok {
+				return messages, nil
+			}
+			messages = append(messages, message)
+		default:
+			return messages, nil
+		}
+	}
+	return messages, nil
 }
 
 func (c *channelConsumer) ClaimPending(context.Context, time.Duration, int64) ([]queue.StreamMessage, error) {
@@ -762,6 +838,12 @@ func (h *gateHandler) Handle(ctx context.Context, _ *task.Task) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func (s *concurrentStore) status(id string) task.Status {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.statuses[id]
 }
 
 func TestRunFanOutRespectsConcurrencyLimit(t *testing.T) {
@@ -903,5 +985,217 @@ func TestRunWaitsForInFlightTasksOnCancel(t *testing.T) {
 
 	if got := consumer.ackedCount(); got != 2 {
 		t.Fatalf("expected 2 acks for completed tasks, got %d", got)
+	}
+}
+
+type batchConsumer struct {
+	mu          sync.Mutex
+	messages    []queue.StreamMessage
+	acked       []string
+	readCount   int
+	requested   []int64
+	cancelAfter int
+	cancel      context.CancelFunc
+}
+
+func (c *batchConsumer) EnsureGroup(context.Context) error { return nil }
+
+func (c *batchConsumer) ReadBatch(ctx context.Context, count int64) ([]queue.StreamMessage, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.readCount++
+	c.requested = append(c.requested, count)
+	if len(c.messages) == 0 {
+		return nil, queue.ErrNoMessages
+	}
+
+	if count <= 0 {
+		count = 1
+	}
+	if int64(len(c.messages)) < count {
+		count = int64(len(c.messages))
+	}
+	messages := append([]queue.StreamMessage(nil), c.messages[:count]...)
+	c.messages = c.messages[count:]
+	return messages, nil
+}
+
+func (c *batchConsumer) ClaimPending(context.Context, time.Duration, int64) ([]queue.StreamMessage, error) {
+	return nil, nil
+}
+
+func (c *batchConsumer) Ack(_ context.Context, redisID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.acked = append(c.acked, redisID)
+	if c.cancel != nil && c.cancelAfter > 0 && len(c.acked) >= c.cancelAfter {
+		c.cancel()
+	}
+	return nil
+}
+
+func (c *batchConsumer) ackedSnapshot() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.acked...)
+}
+
+func (c *batchConsumer) firstRequestedBatchSize() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.requested) == 0 {
+		return 0
+	}
+	return c.requested[0]
+}
+
+type selectiveFailHandler struct {
+	failTaskID string
+}
+
+func (h selectiveFailHandler) Handle(_ context.Context, currentTask *task.Task) error {
+	if currentTask.ID == h.failTaskID {
+		return errors.New("selected failure")
+	}
+	return nil
+}
+
+func TestRunReadsAndSchedulesBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	consumer := &batchConsumer{
+		messages: []queue.StreamMessage{
+			{RedisID: "msg-1", Task: queue.TaskMessage{ID: "task-1", Type: "concurrent.test"}},
+			{RedisID: "msg-2", Task: queue.TaskMessage{ID: "task-2", Type: "concurrent.test"}},
+			{RedisID: "msg-3", Task: queue.TaskMessage{ID: "task-3", Type: "concurrent.test"}},
+		},
+		cancelAfter: 3,
+		cancel:      cancel,
+	}
+	store := newConcurrentStore()
+	registry := NewHandlerRegistry()
+	if err := registry.Register("concurrent.test", HandlerFunc(func(context.Context, *task.Task) error {
+		return nil
+	})); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	worker := New(consumer, store, slog.Default(), "test-worker").
+		WithHandlerRegistry(registry).
+		WithConcurrency(3).
+		WithBatchSize(3).
+		WithPendingRecovery(0, 0, 0)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(ctx) }()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("worker run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker run did not finish after batch was acked")
+	}
+
+	if got := consumer.firstRequestedBatchSize(); got != 3 {
+		t.Fatalf("expected requested batch size 3, got %d", got)
+	}
+	if got := consumer.ackedSnapshot(); len(got) != 3 {
+		t.Fatalf("expected 3 acks, got %#v", got)
+	}
+}
+
+func TestRunBatchContinuesAfterPartialFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	consumer := &batchConsumer{
+		messages: []queue.StreamMessage{
+			{RedisID: "msg-ok-1", Task: queue.TaskMessage{ID: "task-ok-1", Type: "concurrent.test"}},
+			{RedisID: "msg-fail", Task: queue.TaskMessage{ID: "task-fail", Type: "concurrent.test"}},
+			{RedisID: "msg-ok-2", Task: queue.TaskMessage{ID: "task-ok-2", Type: "concurrent.test"}},
+		},
+		cancelAfter: 3,
+		cancel:      cancel,
+	}
+	store := newConcurrentStore()
+	registry := NewHandlerRegistry()
+	if err := registry.Register("concurrent.test", selectiveFailHandler{failTaskID: "task-fail"}); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	worker := New(consumer, store, slog.Default(), "test-worker").
+		WithHandlerRegistry(registry).
+		WithConcurrency(3).
+		WithBatchSize(3).
+		WithPendingRecovery(0, 0, 0)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(ctx) }()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("worker run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker run did not finish after batch was acked")
+	}
+
+	if got := consumer.ackedSnapshot(); len(got) != 3 {
+		t.Fatalf("expected all batch messages to be acked, got %#v", got)
+	}
+	if got := store.status("task-ok-1"); got != task.StatusSuccess {
+		t.Fatalf("expected first task success, got %q", got)
+	}
+	if got := store.status("task-ok-2"); got != task.StatusSuccess {
+		t.Fatalf("expected second task success, got %q", got)
+	}
+	if got := store.status("task-fail"); got != task.StatusRetrying {
+		t.Fatalf("expected failed task retrying, got %q", got)
+	}
+}
+
+func TestRunBatchAcksTerminalDuplicateMessage(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	consumer := &batchConsumer{
+		messages: []queue.StreamMessage{
+			{RedisID: "msg-done", Task: queue.TaskMessage{ID: "task-done", Type: "concurrent.test"}},
+			{RedisID: "msg-pending", Task: queue.TaskMessage{ID: "task-pending", Type: "concurrent.test"}},
+		},
+		cancelAfter: 2,
+		cancel:      cancel,
+	}
+	store := newConcurrentStore()
+	store.statuses["task-done"] = task.StatusSuccess
+	handler := &countingHandler{}
+	registry := NewHandlerRegistry()
+	if err := registry.Register("concurrent.test", handler); err != nil {
+		t.Fatalf("register handler: %v", err)
+	}
+
+	worker := New(consumer, store, slog.Default(), "test-worker").
+		WithHandlerRegistry(registry).
+		WithConcurrency(2).
+		WithBatchSize(2).
+		WithPendingRecovery(0, 0, 0)
+
+	runDone := make(chan error, 1)
+	go func() { runDone <- worker.Run(ctx) }()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("worker run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker run did not finish after batch was acked")
+	}
+
+	if handler.count != 1 {
+		t.Fatalf("expected only pending task to execute, executed %d times", handler.count)
+	}
+	if got := consumer.ackedSnapshot(); len(got) != 2 {
+		t.Fatalf("expected terminal and pending messages to be acked, got %#v", got)
 	}
 }

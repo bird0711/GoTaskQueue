@@ -42,6 +42,9 @@ func TestHandlerRegistryHandleReturnsUnknownTaskTypeError(t *testing.T) {
 	if unknownErr.TaskType != "missing.type" {
 		t.Fatalf("expected task type missing.type, got %q", unknownErr.TaskType)
 	}
+	if !IsNonRetryable(err) {
+		t.Fatalf("expected unknown task type to be non-retryable, got %T", err)
+	}
 }
 
 func TestHandlerRegistryRegisterRejectsDuplicateTaskType(t *testing.T) {

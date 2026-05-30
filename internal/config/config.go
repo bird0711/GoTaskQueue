@@ -44,6 +44,7 @@ type SchedulerConfig struct {
 
 type WorkerConfig struct {
 	Concurrency int
+	BatchSize   int
 }
 
 func Load() Config {
@@ -76,6 +77,7 @@ func Load() Config {
 		},
 		Worker: WorkerConfig{
 			Concurrency: envInt("WORKER_CONCURRENCY", 4),
+			BatchSize:   envInt("WORKER_BATCH_SIZE", 10),
 		},
 	}
 }

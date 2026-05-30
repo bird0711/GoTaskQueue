@@ -1,6 +1,6 @@
 # GoTaskQueue
 
-GoTaskQueue is a Go distributed task scheduling and asynchronous queue system. It is built as a focused backend engineering project: the system accepts tasks over HTTP, persists task metadata in Postgres, delivers work through Redis Streams, schedules delayed work with Redis ZSET, executes handlers in workers, and exposes operational visibility through metrics and a read-only dashboard.
+GoTaskQueue is a Go asynchronous task queue middleware and backend infrastructure component. It accepts tasks over HTTP, persists task metadata in Postgres, delivers work through Redis Streams, schedules delayed work with Redis ZSET, executes handlers in workers, and exposes operational visibility through metrics and a read-only dashboard.
 
 The project is intentionally not a full workflow platform. The goal is to demonstrate the core design problems behind async task systems: durable state, at-least-once delivery, retries, idempotent submission, delayed scheduling, worker recovery, dead-letter handling, trace correlation, metrics, and graceful shutdown.
 
@@ -72,7 +72,8 @@ running -> failed -> dead
 
 - Asynchronous tasks: `POST /tasks` stores a task and publishes immediate work to Redis Streams.
 - Delayed tasks: future `run_at` values are written to Redis ZSET and dispatched by the scheduler when due.
-- Handler registry: workers dispatch by `task_type`; the app registers `demo.echo` as an example handler.
+- Handler registry: workers dispatch by `task_type`; the app registers `demo.echo` and `webhook.deliver` examples.
+- Handler validation: handlers parse their own JSON payloads and return readable errors; retryable errors follow normal retry/dead handling, while non-retryable errors such as invalid payloads, unknown task types, and webhook 4xx responses go directly to `dead`.
 - Retries: failures move through `failed -> retrying` with exponential second-level backoff.
 - Dead letters: exhausted tasks enter `dead` and are also written to `tasks:dead` with `task_id`, `task_type`, `trace_id`, `last_error`, and `retry_count`.
 - Idempotent submission: repeated `idempotency_key` requests return the existing task and do not publish duplicate work.
@@ -130,6 +131,76 @@ Stop local dependencies:
 make down
 ```
 
+## v1.0 Demo Runbook
+
+Start dependencies and apply migrations:
+
+```sh
+make up
+make migrate-up
+```
+
+Start the application in another terminal:
+
+```sh
+make run
+```
+
+Submit an immediate task:
+
+```sh
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"demo.echo","payload":{"message":"hello now"}}'
+```
+
+Submit a delayed task:
+
+```sh
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"demo.echo","payload":{"message":"hello later"},"run_at":"2099-01-01T00:00:00Z"}'
+```
+
+Submit a `webhook.deliver` task. For a local demo, point `url` at any temporary HTTP endpoint you control:
+
+```sh
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"webhook.deliver","payload":{"url":"https://example.com/webhook","method":"POST","headers":{"Content-Type":"application/json"},"body":{"message":"hello webhook"}}}'
+```
+
+Create failure cases and observe retry/dead behavior:
+
+```sh
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"webhook.deliver","max_retries":0,"payload":{"url":"https://example.com/missing","method":"POST","headers":{},"body":{"message":"bad request"}}}'
+
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"unknown.type","max_retries":0,"payload":{"message":"should become dead"}}'
+```
+
+For retry behavior, point `webhook.deliver` at a temporary endpoint that returns 5xx or times out and leave `max_retries` above zero. For direct dead behavior, invalid payloads, webhook 4xx responses, and unknown task types are deterministic.
+
+Fetch a task, replacing `TASK_ID` with an ID returned by `POST /tasks`:
+
+```sh
+curl -sS http://localhost:8080/tasks/TASK_ID
+```
+
+Open operational views:
+
+```text
+http://localhost:8080/dashboard
+http://localhost:8080/dashboard/tasks/TASK_ID
+http://localhost:8080/metrics
+http://localhost:9090
+```
+
+The dashboard is a read-only operations page for inspecting task state. It is not intended to be a full product website or management console.
+
 ## Configuration
 
 Configuration is environment-variable based. Useful defaults are shown in `.env.example`.
@@ -151,6 +222,7 @@ Configuration is environment-variable based. Useful defaults are shown in `.env.
 | `SCHEDULER_INTERVAL_SECONDS` | `2` | Scheduler tick interval |
 | `SCHEDULER_BATCH_SIZE` | `100` | Scheduler batch size |
 | `WORKER_CONCURRENCY` | `4` | Max in-process concurrent task executions |
+| `WORKER_BATCH_SIZE` | `10` | Max Redis Stream messages read per worker poll |
 
 ## API Examples
 
@@ -176,6 +248,14 @@ Create a delayed task:
 curl -sS -X POST http://localhost:8080/tasks \
   -H 'Content-Type: application/json' \
   -d '{"task_type":"demo.echo","payload":{"message":"later"},"run_at":"2099-01-01T00:00:00Z"}'
+```
+
+Create a webhook delivery task:
+
+```sh
+curl -sS -X POST http://localhost:8080/tasks \
+  -H 'Content-Type: application/json' \
+  -d '{"task_type":"webhook.deliver","payload":{"url":"https://example.com/webhook","method":"POST","headers":{"Content-Type":"application/json"},"body":{"message":"hello"}}}'
 ```
 
 Create an idempotent task:
@@ -294,19 +374,20 @@ Key tradeoffs to discuss:
 
 - The system uses at-least-once delivery. This keeps the design realistic and avoids pretending Redis Streams plus Postgres can provide exactly-once side effects.
 - Postgres is the source of truth. Redis is used for delivery, scheduling triggers, and dead-letter notifications.
+- Redis Stream pending recovery handles messages delivered but not acked before a worker crash; Postgres running-timeout recovery handles tasks that were marked running but stopped making progress.
 - Conditional state updates protect worker claims and scheduler dispatch from duplicate execution paths.
 - `idempotency_key` prevents duplicate task creation at submission time, but handler side effects still need business-level idempotency.
-- Pending message recovery and running-timeout recovery address different crash windows.
+- Dead letters make exhausted or non-retryable failures inspectable without storing full payloads in Redis.
+- Graceful shutdown cancels runners, waits for in-flight worker tasks, and only then closes Redis/Postgres dependencies.
 - `trace_id` is lightweight correlation, not a full distributed tracing implementation.
 - Dead stream publication is best-effort and does not block the Postgres terminal state.
 
 ## Future Work
 
-- Worker batch consumption: read and process more than one Redis Stream message per poll to improve throughput.
 - `XAUTOCLAIM`: replace the current pending recovery scan/claim path with Redis `XAUTOCLAIM` for simpler pending ownership transfer.
 - Prometheus official client: replace the lightweight custom text exposition with `prometheus/client_golang` histograms, labels, and registry support.
-- Dashboard query indexes: add indexes or pagination if recent task and detail views become expensive on large task tables.
+- Dashboard pagination: add pagination if recent task and detail views become expensive on large task tables.
 - Task type concurrency limits: constrain noisy task types independently from global `WORKER_CONCURRENCY`.
 - Rate limiting: add per-task-type or global rate controls for third-party integrations.
-- Handler examples: add realistic handlers beyond `demo.echo`, such as webhook delivery or report generation.
+- Handler examples: add additional realistic handlers such as report generation.
 - Operational tooling: add CLI helpers for inspecting queues, pending messages, and dead tasks.
