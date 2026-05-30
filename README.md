@@ -1,61 +1,69 @@
 # GoTaskQueue
 
-GoTaskQueue is a Go asynchronous task queue middleware and backend infrastructure component. It accepts tasks over HTTP, persists task metadata in Postgres, delivers work through Redis Streams, schedules delayed work with Redis ZSET, executes handlers in workers, and exposes operational visibility through metrics and a read-only dashboard.
+GoTaskQueue 是一个基于 Go、Redis Streams 和 Postgres 的异步任务队列系统。它不是完整网站，也不是工作流平台，而是一个后端基础设施组件：业务系统通过 HTTP API 提交任务，GoTaskQueue 负责持久化、投递、调度、执行、重试、死信和观测。
 
-The project is intentionally not a full workflow platform. The goal is to demonstrate the core design problems behind async task systems: durable state, at-least-once delivery, retries, idempotent submission, delayed scheduling, worker recovery, dead-letter handling, trace correlation, metrics, and graceful shutdown.
+这个项目适合作为 Go 后端作品展示，重点体现：
 
-## What It Solves
+- Redis Streams 的 at-least-once 投递。
+- Postgres 作为任务状态事实来源。
+- 延迟任务调度。
+- Worker 并发和批量消费。
+- 幂等提交。
+- 失败重试、超时、死信。
+- trace_id 链路关联。
+- Prometheus 指标和只读 dashboard。
+- Docker Compose 本地依赖和自动化测试。
 
-Synchronous APIs should not block on slow or unreliable work such as sending messages, generating reports, calling third-party APIs, or running background maintenance. GoTaskQueue separates submission from execution:
+## 功能特性
 
-- API callers get a durable task record immediately.
-- Redis Streams decouple producers from workers.
-- Postgres remains the source of truth for task state.
-- Redis ZSET triggers delayed execution without making Redis the durable task store.
-- Worker and scheduler recovery paths reduce the impact of crashes and timeouts.
-- Metrics, trace IDs, dashboard pages, and a dead stream make failures observable.
+- 任务提交：`POST /tasks` 创建异步任务。
+- 任务查询：`GET /tasks/{id}` 查询任务状态。
+- 延迟任务：未来 `run_at` 会写入 Redis ZSET，由 Scheduler 到期投递。
+- Redis Stream 队列：立即任务和到期任务通过 Redis Streams 投递给 Worker。
+- Postgres 持久化：任务元数据、状态、错误、重试次数等存储在 Postgres。
+- 幂等提交：`idempotency_key` 防止重复创建任务。
+- Worker 并发：`WORKER_CONCURRENCY` 控制同时执行任务数量。
+- 批量消费：`WORKER_BATCH_SIZE` 控制每次最多读取多少条 Redis Stream 消息。
+- 重试和死信：失败任务按退避策略重试，耗尽后进入 `dead` 并写入 `tasks:dead`。
+- 真实 handler 示例：内置 `webhook.deliver`，可发送 HTTP webhook。
+- 可观测性：提供 `/metrics`、Prometheus 和只读 dashboard。
+- 优雅关闭：进程退出时等待 server、worker、scheduler 正常收尾。
 
-## Architecture
+## 架构概览
 
 ```text
-              HTTP API
-                 |
-                 v
-        +------------------+
-        |   Task Service   |
-        +------------------+
-          |              |
-          v              v
-   +-------------+   +----------------+
-   |  Postgres   |   | Redis Scheduled|
-   | tasks table |   | ZSET           |
-   +-------------+   +----------------+
-          |              |
-          |              v
-          |        +-----------+
-          |        | Scheduler |
-          |        +-----------+
-          |              |
-          v              v
-        +------------------+
-        | Redis Stream     |
-        | tasks:stream     |
-        +------------------+
-                 |
-                 v
-        +------------------+
-        | Worker Pool      |
-        | handler registry |
-        +------------------+
-          |              |
-          v              v
-   +-------------+   +----------------+
-   |  Postgres   |   | Dead Stream    |
-   | final state |   | tasks:dead     |
-   +-------------+   +----------------+
+HTTP API
+   |
+   v
+Task Service
+   |
+   +--> Postgres tasks table
+   |
+   +--> Redis Stream tasks:stream
+   |
+   +--> Redis ZSET tasks:scheduled
+
+Scheduler
+   |
+   v
+Redis Stream tasks:stream
+   |
+   v
+Worker
+   |
+   +--> Handler registry
+   +--> Postgres 状态更新
+   +--> Redis Stream ack
+   +--> Redis Stream tasks:dead
+
+Metrics / Dashboard
+   |
+   +--> /metrics
+   +--> /dashboard
+   +--> /dashboard/tasks/{id}
 ```
 
-Task state flow:
+任务状态流转：
 
 ```text
 scheduled -> pending -> running -> success
@@ -66,167 +74,52 @@ running -> failed -> retrying
 running -> failed -> dead
 ```
 
-`success` and `dead` are terminal states. Delivery is at-least-once, not exactly-once; task handlers should still be written with external idempotency in mind.
+系统采用 at-least-once delivery，不承诺 exactly-once。外部副作用任务仍需要业务侧保证幂等。
 
-## Core Features
+## 快速启动
 
-- Asynchronous tasks: `POST /tasks` stores a task and publishes immediate work to Redis Streams.
-- Delayed tasks: future `run_at` values are written to Redis ZSET and dispatched by the scheduler when due.
-- Handler registry: workers dispatch by `task_type`; the app registers `demo.echo` and `webhook.deliver` examples.
-- Handler validation: handlers parse their own JSON payloads and return readable errors; retryable errors follow normal retry/dead handling, while non-retryable errors such as invalid payloads, unknown task types, and webhook 4xx responses go directly to `dead`.
-- Retries: failures move through `failed -> retrying` with exponential second-level backoff.
-- Dead letters: exhausted tasks enter `dead` and are also written to `tasks:dead` with `task_id`, `task_type`, `trace_id`, `last_error`, and `retry_count`.
-- Idempotent submission: repeated `idempotency_key` requests return the existing task and do not publish duplicate work.
-- Recovery: Redis pending messages can be claimed; expired Postgres `running` tasks are recovered by the scheduler.
-- Timeouts: workers execute with per-task `timeout_seconds`.
-- Trace correlation: `trace_id` is accepted or generated at creation, stored in Postgres, sent through Redis Stream messages, and logged by worker lifecycle events.
-- Metrics: `/metrics` exposes `gotaskqueue_*` counters, summaries, and gauges.
-- Dashboard: `/dashboard` shows status counts, queue backlog, recent tasks, failed/dead tasks, and read-only task detail pages.
-- Graceful shutdown: the app waits for server, worker, and scheduler goroutines to exit before closing dependencies.
+### 1. 准备环境
 
-## Local Setup
+需要安装：
 
-Prerequisites:
+- Go，版本以 `go.mod` 为准。
+- Docker 和 Docker Compose。
+- `golangci-lint`。
+- `make`。
 
-- Go matching `go.mod`
-- Docker with Compose support
-- `golangci-lint` on `PATH`
-
-Start local dependencies:
+### 2. 启动本地依赖
 
 ```sh
 make up
 ```
 
-Apply database migrations:
+这会启动：
+
+- Redis：`localhost:6380`
+- Postgres：`localhost:5432`
+- Prometheus：`localhost:9090`
+
+### 3. 执行数据库迁移
 
 ```sh
 make migrate-up
 ```
 
-Run checks:
+迁移脚本支持重复执行，已执行过的 migration 会跳过。
 
-```sh
-make check
-```
-
-Start the application:
+### 4. 启动应用
 
 ```sh
 make run
 ```
 
-Default local endpoints:
-
-- API and dashboard: `http://localhost:8080`
-- Dashboard: `http://localhost:8080/dashboard`
-- Metrics: `http://localhost:8080/metrics`
-- Prometheus: `http://localhost:9090`
-- Redis: `localhost:6380`
-- Postgres: `localhost:5432`
-
-Stop local dependencies:
-
-```sh
-make down
-```
-
-## v1.0 Demo Runbook
-
-Start dependencies and apply migrations:
-
-```sh
-make up
-make migrate-up
-```
-
-Start the application in another terminal:
-
-```sh
-make run
-```
-
-Submit an immediate task:
-
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"demo.echo","payload":{"message":"hello now"}}'
-```
-
-Submit a delayed task:
-
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"demo.echo","payload":{"message":"hello later"},"run_at":"2099-01-01T00:00:00Z"}'
-```
-
-Submit a `webhook.deliver` task. For a local demo, point `url` at any temporary HTTP endpoint you control:
-
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"webhook.deliver","payload":{"url":"https://example.com/webhook","method":"POST","headers":{"Content-Type":"application/json"},"body":{"message":"hello webhook"}}}'
-```
-
-Create failure cases and observe retry/dead behavior:
-
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"webhook.deliver","max_retries":0,"payload":{"url":"https://example.com/missing","method":"POST","headers":{},"body":{"message":"bad request"}}}'
-
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"unknown.type","max_retries":0,"payload":{"message":"should become dead"}}'
-```
-
-For retry behavior, point `webhook.deliver` at a temporary endpoint that returns 5xx or times out and leave `max_retries` above zero. For direct dead behavior, invalid payloads, webhook 4xx responses, and unknown task types are deterministic.
-
-Fetch a task, replacing `TASK_ID` with an ID returned by `POST /tasks`:
-
-```sh
-curl -sS http://localhost:8080/tasks/TASK_ID
-```
-
-Open operational views:
+应用默认监听：
 
 ```text
-http://localhost:8080/dashboard
-http://localhost:8080/dashboard/tasks/TASK_ID
-http://localhost:8080/metrics
-http://localhost:9090
+http://localhost:8080
 ```
 
-The dashboard is a read-only operations page for inspecting task state. It is not intended to be a full product website or management console.
-
-## Configuration
-
-Configuration is environment-variable based. Useful defaults are shown in `.env.example`.
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `HTTP_ADDR` | `:8080` | Go HTTP server listen address |
-| `REDIS_ADDR` | `localhost:6380` | Redis client address |
-| `REDIS_STREAM_NAME` | `tasks:stream` | Main Redis Stream |
-| `REDIS_SCHEDULED_SET_KEY` | `tasks:scheduled` | Delayed task ZSET |
-| `REDIS_DEAD_STREAM_NAME` | `tasks:dead` | Dead-letter Redis Stream |
-| `REDIS_CONSUMER_GROUP` | `gotaskqueue-workers` | Redis Stream consumer group |
-| `REDIS_CONSUMER_NAME` | `gotaskqueue-worker-1` | Worker consumer name |
-| `POSTGRES_HOST` | `localhost` | Postgres host |
-| `POSTGRES_PORT` | `5432` | Postgres port |
-| `POSTGRES_DB` | `gotaskqueue` | Postgres database |
-| `POSTGRES_USER` | `gotaskqueue` | Postgres user |
-| `POSTGRES_PASSWORD` | `gotaskqueue` | Postgres password |
-| `SCHEDULER_INTERVAL_SECONDS` | `2` | Scheduler tick interval |
-| `SCHEDULER_BATCH_SIZE` | `100` | Scheduler batch size |
-| `WORKER_CONCURRENCY` | `4` | Max in-process concurrent task executions |
-| `WORKER_BATCH_SIZE` | `10` | Max Redis Stream messages read per worker poll |
-
-## API Examples
-
-Create an immediate task:
+### 5. 提交一个立即任务
 
 ```sh
 curl -sS -X POST http://localhost:8080/tasks \
@@ -234,15 +127,25 @@ curl -sS -X POST http://localhost:8080/tasks \
   -d '{"task_type":"demo.echo","payload":{"message":"hello"}}'
 ```
 
-Create a task with an external trace ID:
+返回结果中会包含任务 ID，例如：
 
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"demo.echo","trace_id":"trace_from_client_123","payload":{"message":"trace me"}}'
+```json
+{
+  "id": "task_xxx",
+  "task_type": "demo.echo",
+  "status": "pending"
+}
 ```
 
-Create a delayed task:
+### 6. 查询任务状态
+
+```sh
+curl -sS http://localhost:8080/tasks/TASK_ID
+```
+
+把 `TASK_ID` 替换成上一步返回的任务 ID。
+
+### 7. 提交一个延迟任务
 
 ```sh
 curl -sS -X POST http://localhost:8080/tasks \
@@ -250,59 +153,73 @@ curl -sS -X POST http://localhost:8080/tasks \
   -d '{"task_type":"demo.echo","payload":{"message":"later"},"run_at":"2099-01-01T00:00:00Z"}'
 ```
 
-Create a webhook delivery task:
+### 8. 提交一个 webhook 任务
+
+`webhook.deliver` 是项目内置的真实业务 handler 示例。
 
 ```sh
 curl -sS -X POST http://localhost:8080/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"task_type":"webhook.deliver","payload":{"url":"https://example.com/webhook","method":"POST","headers":{"Content-Type":"application/json"},"body":{"message":"hello"}}}'
+  -d '{"task_type":"webhook.deliver","payload":{"url":"https://example.com/webhook","method":"POST","headers":{"Content-Type":"application/json"},"body":{"message":"hello webhook"}}}'
 ```
 
-Create an idempotent task:
+行为说明：
+
+- 2xx：任务成功。
+- 4xx：不可重试错误，任务进入 `dead`。
+- 5xx、网络错误、超时：可重试错误，进入 retry / dead 链路。
+
+### 9. 制造一个失败任务
 
 ```sh
 curl -sS -X POST http://localhost:8080/tasks \
   -H 'Content-Type: application/json' \
-  -d '{"task_type":"demo.echo","idempotency_key":"request-123","payload":{"message":"only once"}}'
+  -d '{"task_type":"unknown.type","max_retries":0,"payload":{"message":"fail"}}'
 ```
 
-Force a task into the failure/dead path by using an unknown task type and no retries:
+这个任务会进入 `dead`，可用于演示失败和死信链路。
 
-```sh
-curl -sS -X POST http://localhost:8080/tasks \
-  -H 'Content-Type: application/json' \
-  -d '{"task_type":"unknown.type","max_retries":0,"payload":{"message":"should fail"}}'
-```
+## Dashboard
 
-Fetch task state:
-
-```sh
-curl -sS http://localhost:8080/tasks/TASK_ID
-```
-
-Task responses include fields such as `id`, `task_type`, `payload`, `status`, `trace_id`, `retry_count`, `last_error`, `worker_id`, `started_at`, `finished_at`, `created_at`, and `updated_at`.
-
-## Dashboard And Prometheus
-
-Open the dashboard:
+打开：
 
 ```text
 http://localhost:8080/dashboard
 ```
 
-The dashboard is read-only. It shows total tasks, status counts, queue backlog, running task count, recent tasks, recent failed tasks, recent dead tasks, and task detail pages at:
+dashboard 是只读运维页面，展示：
+
+- 任务总数。
+- 各状态任务数量。
+- 队列积压。
+- running 数量。
+- 最近任务。
+- 最近失败任务。
+- 最近 dead 任务。
+
+任务详情页：
 
 ```text
 http://localhost:8080/dashboard/tasks/TASK_ID
 ```
 
-Fetch Prometheus metrics:
+详情页展示任务 payload、状态、错误、重试次数、运行时间、trace_id 等信息。
 
-```sh
-curl -sS http://localhost:8080/metrics
+## Metrics 和 Prometheus
+
+应用暴露 Prometheus 指标：
+
+```text
+http://localhost:8080/metrics
 ```
 
-Useful metric names:
+Prometheus 页面：
+
+```text
+http://localhost:9090
+```
+
+常用指标：
 
 - `gotaskqueue_tasks_submitted_total`
 - `gotaskqueue_tasks_started_total`
@@ -315,79 +232,85 @@ Useful metric names:
 - `gotaskqueue_queue_backlog`
 - `gotaskqueue_worker_running_tasks`
 
-Open Prometheus:
+## 配置项
 
-```text
-http://localhost:9090
-```
+常用环境变量见 `.env.example`：
 
-## Dead Stream
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HTTP_ADDR` | `:8080` | HTTP 服务监听地址 |
+| `REDIS_ADDR` | `localhost:6380` | Redis 地址 |
+| `REDIS_STREAM_NAME` | `tasks:stream` | 主任务 Stream |
+| `REDIS_SCHEDULED_SET_KEY` | `tasks:scheduled` | 延迟任务 ZSET |
+| `REDIS_DEAD_STREAM_NAME` | `tasks:dead` | 死信 Stream |
+| `REDIS_CONSUMER_GROUP` | `gotaskqueue-workers` | Redis consumer group |
+| `REDIS_CONSUMER_NAME` | `gotaskqueue-worker-1` | Redis consumer 名称 |
+| `POSTGRES_HOST` | `localhost` | Postgres host |
+| `POSTGRES_PORT` | `5432` | Postgres port |
+| `POSTGRES_DB` | `gotaskqueue` | Postgres 数据库 |
+| `POSTGRES_USER` | `gotaskqueue` | Postgres 用户 |
+| `POSTGRES_PASSWORD` | `gotaskqueue` | Postgres 密码 |
+| `SCHEDULER_INTERVAL_SECONDS` | `2` | Scheduler 扫描间隔 |
+| `SCHEDULER_BATCH_SIZE` | `100` | Scheduler 每批扫描数量 |
+| `WORKER_CONCURRENCY` | `4` | Worker 最大并发执行数 |
+| `WORKER_BATCH_SIZE` | `10` | Worker 每次最多读取消息数 |
 
-When a task reaches `dead`, the worker or scheduler attempts to publish a compact dead-letter message to Redis Stream `tasks:dead`.
+## 测试
 
-Inspect it locally:
-
-```sh
-docker compose exec redis redis-cli XLEN tasks:dead
-docker compose exec redis redis-cli XREVRANGE tasks:dead + - COUNT 5
-```
-
-Dead stream messages intentionally omit full payload. Consumers can use `task_id` to fetch the full task from Postgres through `GET /tasks/{id}`.
-
-## Tests
-
-Run unit, vet, and lint checks:
+运行单元测试、vet 和 lint：
 
 ```sh
 make check
 ```
 
-Run integration tests against local Docker Compose dependencies:
+运行集成测试：
 
 ```sh
 make integration-test
 ```
 
-`make integration-test` applies migrations and runs tests tagged with `integration`. The suite verifies API, Postgres, Redis Stream, Redis ZSET, Scheduler, Worker, idempotent submission, unknown `task_type`, and dead stream behavior.
+集成测试依赖本地 Docker Compose 中的 Redis 和 Postgres。
 
-CI runs `make check` by default. Integration tests are intentionally separate because they require local Redis and Postgres services.
+## 常用命令
 
-## Project Structure
-
-```text
-cmd/gotaskqueue/        application entrypoint
-internal/app/           top-level component wiring and graceful shutdown
-internal/config/        environment configuration
-internal/httpserver/    API, metrics endpoint, dashboard
-internal/task/          task model, store, state machine, retry logic
-internal/queue/         Redis Stream, ZSET, dead stream adapters
-internal/scheduler/     delayed task dispatch and running-timeout recovery
-internal/worker/        Redis consumer, handler registry, worker pool
-migrations/             Postgres schema migrations
-configs/prometheus/     Prometheus scrape configuration
-docs/                   design notes, status, manual acceptance
+```sh
+make up              # 启动 Redis / Postgres / Prometheus
+make migrate-up      # 执行数据库迁移
+make run             # 启动 Go 应用
+make check           # 单元测试 + vet + lint
+make integration-test # 集成测试
+make down            # 停止本地依赖
 ```
 
-## Design Notes For Interviews
+## 项目结构
 
-Key tradeoffs to discuss:
+```text
+cmd/gotaskqueue/        应用入口
+internal/app/           应用组装和 graceful shutdown
+internal/config/        环境变量配置
+internal/httpserver/    HTTP API、metrics、dashboard
+internal/task/          任务模型、状态机、存储和 service
+internal/queue/         Redis Stream、ZSET、dead stream 适配
+internal/scheduler/     延迟任务调度和 running timeout recovery
+internal/worker/        Redis consumer、handler registry、worker pool
+migrations/             Postgres schema migrations
+configs/prometheus/     Prometheus 配置
+scripts/                本地辅助脚本
+```
 
-- The system uses at-least-once delivery. This keeps the design realistic and avoids pretending Redis Streams plus Postgres can provide exactly-once side effects.
-- Postgres is the source of truth. Redis is used for delivery, scheduling triggers, and dead-letter notifications.
-- Redis Stream pending recovery handles messages delivered but not acked before a worker crash; Postgres running-timeout recovery handles tasks that were marked running but stopped making progress.
-- Conditional state updates protect worker claims and scheduler dispatch from duplicate execution paths.
-- `idempotency_key` prevents duplicate task creation at submission time, but handler side effects still need business-level idempotency.
-- Dead letters make exhausted or non-retryable failures inspectable without storing full payloads in Redis.
-- Graceful shutdown cancels runners, waits for in-flight worker tasks, and only then closes Redis/Postgres dependencies.
-- `trace_id` is lightweight correlation, not a full distributed tracing implementation.
-- Dead stream publication is best-effort and does not block the Postgres terminal state.
+## 面试讲解重点
 
-## Future Work
+- 为什么使用 Redis Streams，而不是只用数据库轮询。
+- 为什么 Postgres 是任务状态的 source of truth。
+- at-least-once delivery 和 exactly-once 的取舍。
+- Redis pending recovery 和 Postgres running timeout recovery 分别解决什么问题。
+- `idempotency_key` 如何降低重复提交影响。
+- retry、dead stream、不可重试错误如何设计。
+- `WORKER_CONCURRENCY` 和 `WORKER_BATCH_SIZE` 如何配合。
+- graceful shutdown 如何避免任务处理中断。
 
-- `XAUTOCLAIM`: replace the current pending recovery scan/claim path with Redis `XAUTOCLAIM` for simpler pending ownership transfer.
-- Prometheus official client: replace the lightweight custom text exposition with `prometheus/client_golang` histograms, labels, and registry support.
-- Dashboard pagination: add pagination if recent task and detail views become expensive on large task tables.
-- Task type concurrency limits: constrain noisy task types independently from global `WORKER_CONCURRENCY`.
-- Rate limiting: add per-task-type or global rate controls for third-party integrations.
-- Handler examples: add additional realistic handlers such as report generation.
-- Operational tooling: add CLI helpers for inspecting queues, pending messages, and dead tasks.
+## 本地数据和上传说明
+
+Docker 本地数据目录 `.docker-data/` 已写入 `.gitignore`，不会上传到 Git。
+
+`.env`、日志、构建产物、编辑器配置、AI 控制文档和开发过程文档也已忽略。公开仓库只保留运行项目所需的源码、配置、迁移、测试和 README。

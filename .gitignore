@@ -35,5 +35,15 @@ postgres-data/
 redis-data/
 prometheus-data/
 
+# AI control / local development process docs
+AGENTS.md
+docs/rules.md
+docs/status.md
+docs/decisions.md
+docs/next.md
+docs/log.md
+docs/next-sequence.md
+docs/manual-acceptance.md
+
 # Claude
 .claude/
