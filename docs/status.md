@@ -38,11 +38,14 @@
 - `/metrics` 会基于 Postgres 当前状态提供队列积压和 running 任务数量 gauge。
 - Go HTTP Server 已提供只读 dashboard，可展示任务总数、各状态数量、队列积压、running 数量、最近任务、最近失败任务和最近 dead 任务。
 - dashboard 已提供只读任务详情页，可查看任务 payload、错误、重试次数、运行时间等字段，并通过任务 ID 链接进入。
+- dashboard 最近任务查询已添加 Postgres 索引：`tasks_status_updated_created_idx` 和 `tasks_updated_created_idx`。
+- dashboard HTML 模板已从 Go 源文件拆分为嵌入式模板文件，页面内容和只读路由保持不变。
 - 已添加基础本地验证入口 `make check`，会运行 `go test ./...`、`go vet ./...` 和 `golangci-lint run ./...`。
 - 已添加集成测试入口 `make integration-test`，使用本地 Docker Compose 依赖验证 API、Postgres、Redis Stream、Redis ZSET、Worker、Scheduler 的协作链路。
 - Makefile 已提供 `make up`、`make down`、`make migrate-up`、`make run`、`make check` 常用命令。
 - 已添加 GitHub Actions CI，在 push 和 pull request 时运行 `make check`。
 - 已添加 MVP 手动验收和演示文档：`docs/manual-acceptance.md`。
+- 已补充 README 总入口文档，覆盖项目定位、架构与任务流转、核心功能、本地启动、API 示例、dashboard、Prometheus、测试命令和后续优化方向。
 - MVP 收尾验收已通过：`make check`、立即任务、短延迟任务、dashboard、应用 metrics、Prometheus 查询均验证通过。
 - `make migrate-up` 已支持 `schema_migrations` 版本记录，会按文件顺序执行未执行的 `migrations/*.up.sql` 并跳过已记录版本。
 - 第二版最终验收已通过：`make check`、幂等提交、Redis ZSET 延迟任务、running timeout recovery、重复 `make migrate-up`、dashboard、应用 metrics 和 Prometheus 查询均验证通过。
